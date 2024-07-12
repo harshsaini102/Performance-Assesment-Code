@@ -1,0 +1,236 @@
+import sys
+import logging
+import pymysql
+import os
+import glob
+import json
+import requests
+from datetime import date
+from datetime import datetime, timedelta, timezone
+import boto3, os
+import xlrd
+import pandas as pd
+import numpy as np
+from io import BytesIO
+from bs4 import BeautifulSoup
+from oauth2client.service_account import ServiceAccountCredentials
+import gspread
+import gspread_dataframe as gd
+
+s3 = boto3.resource('s3')
+bucket = s3.Bucket('datalake path')
+
+from Py_Functions.pyfunctions import *
+
+def lambda_handler(event, context):
+    
+    try:
+        delete_all_files_in_folder('/tmp/','csv')
+        
+        download_all_objects_in_folder('datalake path','datalake path/Year_End_Report','')
+        df1 = pd.read_csv("/tmp/Year_End_Report.csv", skiprows=2, encoding='utf8', dtype=str)
+        
+        download_all_objects_in_folder('datalake path','datalake path/obective_setter','')
+        EPE_First = pd.read_csv("/tmp/EPE_MASTER.csv", encoding='utf8', dtype=str)
+        
+        download_all_objects_in_folder('datalake path','datalake path/Active_employee_details','')
+        df = pd.read_csv("/tmp/Active_employee_details.csv", encoding='utf8', dtype=str)
+        
+        #Terminated employees report
+        download_all_objects_in_folder('datalake path','datalake path/Terminated_employees_With_Basic_Details','')
+        Terms = pd.read_csv("/tmp/Terminated_employees_With_Basic_Details.csv", encoding='utf8', dtype=str)
+        
+        download_all_objects_in_folder('datalake path','datalake path/In Out Scope','')
+        In_out_Scope = pd.read_csv("/tmp/In Out Scope.csv", encoding='utf8', dtype=str)
+        
+        
+        Exclusion_IDs= force_google_sheet_import('googlesheet link','Sheet1')
+        Exclusion_IDs = Exclusion_IDs.astype(str)
+        Exclusion_IDs = Exclusion_IDs.replace(np.nan,"")
+        Exclusion_IDs=Exclusion_IDs[['Emp Id']]
+        
+        
+        #-------removing employees hire date after 10/1/22---------------------------------------------
+        df[['Hire Date']] = df[['Hire Date']].apply(pd.to_datetime)
+        df = df.drop(df[df['Hire Date']>="10-01-2023"].index)
+        df['Hire Date'] = pd.to_datetime(df['Hire Date'], format='%y-%m-%d %H:%M:%S')
+        df['Hire Date']=df['Hire Date'].dt.strftime('%m/%d/%Y')
+        
+        #--------------------------------------------------------------------------------------
+        df1.fillna('',inplace=True)
+        
+        Objectives=df1.loc[df1['Section ID']=='5']
+
+        Objectives=Objectives[['Subject User ID','Leadership Role Expectation Name','Leadership Role Expectation Official Rating Description']]
+        Objectives['Leadership Role Expectation Name'] = Objectives['Leadership Role Expectation Name'].str.strip()
+
+        pivot = Objectives.pivot_table(index =['Subject User ID'],
+                       columns = ['Leadership Role Expectation Name'],
+                        values=['Leadership Role Expectation Official Rating Description'],aggfunc='first')
+
+        pivot.columns = pivot.columns.droplevel(0)
+
+
+        Year_End_Summary=df1.loc[df1['Section ID']=='6']
+        Year_End_Summary=Year_End_Summary[['Subject User ID','Section Name','Overall Performance Rating Description']]
+
+
+      
+        PL_ack=df1.loc[df1['Section ID']=='7']
+        PL_ack = PL_ack.drop(PL_ack[PL_ack['Section Custom Field Value']== ''].index)
+        PL_ack=PL_ack[['Subject User ID','Section Custom Field Name','Section Custom Field Value']]
+        
+
+        
+        df2=df1.sort_values(by =['Subject User ID'],ascending=False )
+        df2.drop_duplicates(subset=['Subject User ID'], keep='first', inplace=True)
+        df2=df2[['Subject User ID','Subject Username','Subject Email']]
+        
+        
+        df2 = df2.merge(pivot,how='left',left_on='Subject User ID',right_on='Subject User ID')
+        df2 = df2.merge(Year_End_Summary,how='left',left_on='Subject User ID',right_on='Subject User ID')
+        df2 = df2.merge(PL_ack,how='left',left_on='Subject User ID',right_on='Subject User ID')
+        
+        df2 = df2.replace(np.nan,"")
+        df2.drop(['Section Name','Section Custom Field Name'], axis = 1, inplace=True)
+        df2 = df2.rename(columns={'Overall Performance Rating Description':'Year-End Assessment - Overall Summary','Section Custom Field Value':'Year End Acknowledgement'})
+        df2['Year End Acknowledgement']=np.where((df2['Year End Acknowledgement']!=''),'Yes','')
+        
+        
+        
+        Hie_merged = df.merge(df2,how='left',left_on='Email',right_on='Subject Email')
+        
+
+        Hie_merged=Hie_merged.sort_values(by =['Business Performance','My Leadership and Values','Organization and Talent','Strategic/Project Impact'],ascending=False )
+        Hie_merged.drop_duplicates(subset=['Username'], keep='first', inplace=True)
+        
+        Hie_merged['exclusion']=Hie_merged['Country']+Hie_merged['Job Code']
+        
+        cond = Hie_merged['exclusion'].isin(In_out_Scope['Index'])
+        Hie_merged.drop(Hie_merged[cond].index, inplace = True)
+        Hie_merged = Hie_merged.replace(np.nan,"")
+
+        
+        
+        Hie_merged=Hie_merged.drop(Hie_merged[Hie_merged["person id"] == ""].index)
+        Hie_merged=Hie_merged.drop(Hie_merged[Hie_merged["Employee Status"] == "Unpaid Leave"].index)
+        Hie_merged=Hie_merged.drop(Hie_merged[Hie_merged["Employment Type"] == "Intern"].index)
+        
+         
+   
+
+        EPE_First=EPE_First[['Email','Business Performance','My Leadership and Values','Organization and Talent','Strategic/Project Impact']]
+        
+        EPE_First = EPE_First.astype({'Business Performance': 'float'})
+        EPE_First = EPE_First.astype({'My Leadership and Values': 'float'})
+        EPE_First = EPE_First.astype({'Organization and Talent': 'float'})
+        EPE_First = EPE_First.astype({'Strategic/Project Impact': 'float'})
+        
+                                                     
+        Hie_merged = Hie_merged.rename(columns={'VP Name':'Leader','Business Performance':'YE Rating-Business Performance',
+                                                'My Leadership and Values':'YE Rating-My Leadership and Values',
+                                                'Organization and Talent':'YE Rating-Organization and Talent',
+                                                'Strategic/Project Impact':'YE Rating-Strategic/Project Impact'})
+        
+        #Append termination----------------------------------
+        
+      
+        Terms['Year-End Assessment - Overall Summary'].replace('', np.nan, inplace=True)
+        Terms.dropna(subset=['Year-End Assessment - Overall Summary'], inplace=True)
+       
+        print("Term Drop")       
+        Terms = Terms.rename(columns={'VP Name':'Leader','Business Performance':'YE Rating-Business Performance',
+                                                'My Leadership and Values':'YE Rating-My Leadership and Values',
+                                                'Organization and Talent':'YE Rating-Organization and Talent',
+                                                'Strategic/Project Impact':'YE Rating-Strategic/Project Impact','Employee Status (Picklist Label)':'Employee Status',
+                                                'Job Code (Job Code)':'Job Code','Job Level ID':'Job Level','Supervisor Email':'People Leader Email','People Leader Name':'Supervisor',
+                                                 'Location (Location Name)':'Location','Business HR':'BHR Name','Email Address':'Email','Person Id':'person id'})
+        
+        print("Rename done")  
+        Terms['ID']=Terms['person id']
+        Terms['Name']=Terms['First Name']+" "+ Terms['Last Name']
+        
+        Terms.drop_duplicates(subset=['person id'], keep='first', inplace=True)
+        
+        
+        Hie_merged=Hie_merged.append(Terms)
+        
+        #---------------------------------------------
+        
+        Hie_merged = Hie_merged.merge(EPE_First,how='left',left_on='Email',right_on='Email')
+        
+        Hie_merged['At least one Objective']=np.where((Hie_merged['Business Performance']>0)|(Hie_merged['My Leadership and Values']>0)|
+                                           (Hie_merged['Organization and Talent']>0)|(Hie_merged['Strategic/Project Impact']>0) ,'TRUE','FALSE')      
+        
+        Hie_merged['Total objectives']=Hie_merged['Business Performance']+Hie_merged['My Leadership and Values']+Hie_merged['Organization and Talent']+Hie_merged['Strategic/Project Impact']
+        
+        
+        
+        #-------------------------------------------------------------------------------------------------------
+        
+        Hie_merged=Hie_merged[['person id','Username','Name','Employee Status','Hire Date','Email',
+                              'Job Code','Job Title','Job Level','People Leader Username','Supervisor',
+                              'People Leader Email','Location','Country','BHR Name','Region','Leader',
+                              'Business Performance','My Leadership and Values',
+                              'Organization and Talent','Strategic/Project Impact','Total objectives','At least one Objective','YE Rating-Business Performance',
+                              'YE Rating-My Leadership and Values','YE Rating-Organization and Talent',
+                              'YE Rating-Strategic/Project Impact','Year-End Assessment - Overall Summary','Year End Acknowledgement',
+                              'L1','L2','L3','L4','L5','L6','L7','L8','L9']]
+                              
+        
+        #-----------------------------------------------------------------------------------------------------------------------------
+
+        
+        
+        EPE_Year_End_Global_NonHR=Hie_merged.loc[Hie_merged['Region']!='HR']
+        EPE_Year_End_HR=Hie_merged.loc[Hie_merged['Region']=='HR']
+        EPE_Year_End_Designing=Hie_merged.loc[Hie_merged['Region']=='Designing']
+        EPE_Year_End_IT=Hie_merged.loc[Hie_merged['Region']=='IT']
+        EPE_Year_End_Marketing=Hie_merged.loc[Hie_merged['Region']=='Marketing']
+        EPE_Year_End_Supply=Hie_merged.loc[Hie_merged['Region']=='Supply']
+        EPE_Year_End_Research=Hie_merged.loc[Hie_merged['Region']=='Research']
+        EPE_Year_End_Testing=Hie_merged.loc[Hie_merged['Region']=='Testing']
+        EPE_Year_End_customer_care=Hie_merged.loc[Hie_merged['Region']=='customer_care']
+        EPE_Year_End_Legal=Hie_merged.loc[Hie_merged['Region']=='Legal']
+        EPE_Year_End_Finance=Hie_merged.loc[Hie_merged['Region']=='Finance']
+        EPE_Year_End_Admin=Hie_merged.loc[Hie_merged['Region']=='Admin']
+        EPE_Year_End_Communications=Hie_merged.loc[Hie_merged['Region']=='Communications']
+
+        
+        force_google_sheet_overwrite('googlesheet_path',"ALL - Without HR",EPE_Year_End_Global_NonHR)
+            
+        force_google_sheet_overwrite('googlesheet_path',"Designing",EPE_Year_End_Designing)
+            
+        force_google_sheet_overwrite('googlesheet_path',"IT",EPE_Year_End_IT)
+            
+        force_google_sheet_overwrite('googlesheet_path',"Marketing",EPE_Year_End_Marketing)
+    
+        force_google_sheet_overwrite('1googlesheet_path',"Supply",EPE_Year_End_Supply)
+    
+        force_google_sheet_overwrite('googlesheet_path',"Research",EPE_Year_End_Research)
+    
+        force_google_sheet_overwrite('googlesheet_path',"Testing",EPE_Year_End_Testing)
+            
+        force_google_sheet_overwrite('googlesheet_path',"customer_care",EPE_Year_End_customer_care)
+      
+        force_google_sheet_overwrite('googlesheet_path',"Legal",EPE_Year_End_Legal)
+    
+        force_google_sheet_overwrite('googlesheet_path',"Finance",EPE_Year_End_Finance)
+    
+        force_google_sheet_overwrite('1googlesheet_path',"Admin",EPE_Year_End_Admin)
+           
+        force_google_sheet_overwrite('googlesheet_path',"Communications",EPE_Year_End_Communications)
+
+        force_google_sheet_overwrite('googlesheet_path',"HR",EPE_Year_End_HR)
+        
+        
+        
+        print("RUN SUCCESSFULLY")
+            
+
+    except Exception as err:
+        print(err)
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Lambda function run successfully ')
+    }
